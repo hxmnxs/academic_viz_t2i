@@ -1,4 +1,4 @@
-import google.generativeai as genai
+from google import genai
 import base64
 import json
 import time
@@ -8,6 +8,7 @@ from typing import Optional
 from datetime import datetime
 import hashlib
 import os
+from dotenv import load_dotenv
 
 
 class ImageType(Enum):
@@ -44,6 +45,8 @@ class GenerationMetrics:
 class AcademicImageGenerator:
     def __init__(self, api_key: Optional[str] = None):
         """Initialize Gemini API client"""
+        load_dotenv()
+        
         if api_key is None:
             api_key = os.getenv("GEMINI_API_KEY")
         
@@ -83,27 +86,42 @@ Create a JSON plan with these sections:
 
 Return ONLY valid JSON."""
 
-        try:
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=planning_prompt
-            )
-            response_text = response.text
-            
-            # Extract JSON from response
+        max_retries = 3
+        retry_delay = 2
+        
+        for attempt in range(max_retries):
             try:
-                plan = json.loads(response_text)
-            except json.JSONDecodeError:
-                start = response_text.find('{')
-                end = response_text.rfind('}') + 1
-                if start >= 0 and end > start:
-                    plan = json.loads(response_text[start:end])
+                response = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=planning_prompt
+                )
+                response_text = response.text
+                
+                # Extract JSON from response
+                try:
+                    plan = json.loads(response_text)
+                except json.JSONDecodeError:
+                    start = response_text.find('{')
+                    end = response_text.rfind('}') + 1
+                    if start >= 0 and end > start:
+                        plan = json.loads(response_text[start:end])
+                    else:
+                        raise ValueError("Failed to parse planning response")
+                
+                return plan
+            except Exception as e:
+                error_str = str(e)
+                # Check for rate limit errors
+                if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str or "quota" in error_str.lower():
+                    if attempt < max_retries - 1:
+                        wait_time = retry_delay * (2 ** attempt)  # Exponential backoff
+                        print(f"Rate limit hit. Retrying in {wait_time} seconds (attempt {attempt + 1}/{max_retries})...")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        raise ValueError(f"Planning phase failed after {max_retries} retries: Rate limit exceeded")
                 else:
-                    raise ValueError("Failed to parse planning response")
-            
-            return plan
-        except Exception as e:
-            raise ValueError(f"Planning phase failed: {str(e)}")
+                    raise ValueError(f"Planning phase failed: {error_str}")
     
     def _generate_image_prompt(self, request: ImageGenerationRequest, plan: dict) -> str:
         """Phase 2: Generate optimized prompt for image creation with Gemini"""
@@ -238,11 +256,31 @@ Context: {request.description}"""
             for iteration in range(request.max_retries):
                 gen_start = time.time()
                 
-                response = self.client.models.generate_content(
-                    model=self.model_name,
-                    contents=image_prompt
-                )
-                response_text = response.text
+                # Retry logic for rate limiting
+                retry_delay = 2
+                max_api_retries = 3
+                
+                for api_attempt in range(max_api_retries):
+                    try:
+                        response = self.client.models.generate_content(
+                            model=self.model_name,
+                            contents=image_prompt
+                        )
+                        response_text = response.text
+                        break
+                    except Exception as e:
+                        error_str = str(e)
+                        if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str or "quota" in error_str.lower():
+                            if api_attempt < max_api_retries - 1:
+                                wait_time = retry_delay * (2 ** api_attempt)
+                                print(f"Rate limit hit. Retrying in {wait_time} seconds...")
+                                time.sleep(wait_time)
+                                continue
+                            else:
+                                raise Exception(f"Generation failed after {max_api_retries} retries: Rate limit exceeded")
+                        else:
+                            raise
+                
                 metrics["generation_time"] += time.time() - gen_start
                 
                 # Phase 3: Validation
